@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,12 @@ from sites_config import Site, SITES, get_site
 
 
 DEFAULT_ENGINES = ["google.com", "yahoo.com", "bing.com"]
+
+# Headless when running in CI (GitHub Actions has no display). Set SB_HEADLESS=1
+# or HEADLESS=1 to force it; defaults to headful for local/interactive runs.
+HEADLESS = os.environ.get("SB_HEADLESS", os.environ.get("HEADLESS", "")).lower() in (
+    "1", "true", "yes"
+)
 
 
 # ── PER-ENGINE FLOW ─────────────────────────────────────────────────────
@@ -144,7 +151,7 @@ def run_all(engines: list[str] = DEFAULT_ENGINES, only_site: str | None = None) 
     sites = [get_site(only_site)] if only_site else SITES
     overall: dict[str, dict] = {}
 
-    with SB(uc=True) as sb:
+    with SB(uc=True, headless=HEADLESS) as sb:
         sb.activate_cdp_mode()
         endpoint_url = sb.cdp.get_endpoint_url()
 

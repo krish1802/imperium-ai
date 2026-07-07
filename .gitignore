@@ -6,8 +6,13 @@ gsc_token.json
 .env
 
 # ── Generated data / reports ─────────────────────────────────────────────
-seo_reports/
+# The dashboard reads report CSVs, and the GitHub Actions job commits them,
+# so ALLOW the traffic CSVs while ignoring everything else generated.
 reports/
+seo_reports/**
+!seo_reports/
+!seo_reports/**/
+!seo_reports/**/traffic_generated_*.csv
 
 # ── Python ───────────────────────────────────────────────────────────────
 __pycache__/

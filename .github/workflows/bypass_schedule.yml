@@ -1,0 +1,78 @@
+name: Run bypass 3x daily
+
+# ─────────────────────────────────────────────────────────────────────────
+# Runs bypass-2.py three times a day, then commits any new/updated CSVs
+# under seo_reports/ back to the repo so the Streamlit dashboard can read them.
+#
+# Schedule is in UTC (GitHub requirement). Current times (edit the 3 cron
+# lines below to change):
+#     02:30 UTC = 08:00 IST   (morning)
+#     09:30 UTC = 15:00 IST   (3 PM — your requested slot)
+#     16:30 UTC = 22:00 IST   (evening)
+#
+# To change a time: convert your IST time to UTC by subtracting 5h30m, then
+# write it as "minute hour * * *". You can also trigger a run by hand from the
+# Actions tab (workflow_dispatch).
+# ─────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "30 2 * * *"    # 08:00 IST
+    - cron: "30 9 * * *"    # 15:00 IST
+    - cron: "30 16 * * *"   # 22:00 IST
+  workflow_dispatch: {}      # allow manual runs from the Actions tab
+
+# Let the job push commits back to the repo.
+permissions:
+  contents: write
+
+# Never run two bypass jobs at once (avoids commit races).
+concurrency:
+  group: bypass-schedule
+  cancel-in-progress: false
+
+jobs:
+  bypass:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install seleniumbase playwright
+          # If you keep these in requirements.txt they'll install too:
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Install Chromium for Playwright
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run bypass (headless)
+        env:
+          # SeleniumBase/Playwright run headless on the CI runner (no display).
+          SB_HEADLESS: "true"
+        run: |
+          # The script filename in the repo. Rename here if yours differs.
+          python bypass-2.py || echo "bypass exited non-zero; continuing to commit whatever was written"
+
+      - name: Commit new report CSVs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Force-add because seo_reports/ is git-ignored for local dev.
+          git add -f seo_reports/ || true
+          if git diff --cached --quiet; then
+            echo "No new report data to commit."
+          else
+            git commit -m "chore: automated bypass run $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
