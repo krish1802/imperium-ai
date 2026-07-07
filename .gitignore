@@ -1,0 +1,17 @@
+# ── Secrets — NEVER commit these ─────────────────────────────────────────
+.streamlit/secrets.toml
+*service_account*.json
+*client_secret*.json
+gsc_token.json
+.env
+
+# ── Generated data / reports ─────────────────────────────────────────────
+seo_reports/
+reports/
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
