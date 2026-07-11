@@ -32,12 +32,23 @@ try:
 except Exception:
     GSC_AVAILABLE = False
 
+# LLM visibility modules (citations / referrals / crawlers) — all optional.
+try:
+    import llm_visibility as llmv
+    import llm_referrals as llmr
+    import llm_crawlers as llmc
+    LLM_AVAILABLE = True
+except Exception:
+    LLM_AVAILABLE = False
+
 # ──────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────
 
 REPORT_DIR = os.path.join("seo_reports", "imperiumai_ai")  # matches Site.slug
 CSV_GLOB = os.path.join(REPORT_DIR, "traffic_generated_*.csv")
+LLM_VIS_GLOB = os.path.join(REPORT_DIR, "llm_visibility_*.csv")
+DEFAULT_LOG_DIR = "logs"  # where access logs live (for referrals + crawlers)
 
 st.set_page_config(page_title="imperiumai.ai · SEO Traffic", layout="wide")
 
@@ -50,6 +61,53 @@ st.set_page_config(page_title="imperiumai.ai · SEO Traffic", layout="wide")
 def load_gsc(start: str, end: str, by_query: bool) -> pd.DataFrame:
     """Cached GSC fetch (tracked pages only)."""
     return fetch_gsc(start=start, end=end, by_query=by_query, tracked_only=True)
+
+
+# ---- LLM visibility loaders -----------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def load_llm_citations(pattern: str) -> pd.DataFrame:
+    """Load saved LLM citation-tracking CSVs (from llm_visibility.run_visibility)."""
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return pd.DataFrame()
+    frames = []
+    for f in files:
+        try:
+            frames.append(pd.read_csv(f))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = [c.strip().lower() for c in df.columns]
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    for c in ("mentioned", "cited", "rank", "n_citations"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    return df.dropna(subset=["date"])
+
+
+@st.cache_data(show_spinner="Querying LLM providers …")
+def run_llm_citations(providers: tuple[str, ...]) -> pd.DataFrame:
+    """Live citation probe across the selected providers."""
+    df = llmv.run_visibility(providers=list(providers))
+    if not df.empty:
+        try:
+            llmv.save_report(df)
+        except Exception:
+            pass
+    return df
+
+
+@st.cache_data(show_spinner="Parsing access logs …")
+def load_referrals(log_path: str) -> pd.DataFrame:
+    return llmr.parse_referrals(log_path)
+
+
+@st.cache_data(show_spinner="Parsing access logs …")
+def load_crawlers(log_path: str) -> pd.DataFrame:
+    return llmc.parse_crawlers(log_path)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -123,6 +181,8 @@ st.title("imperiumai.ai — SEO Traffic Dashboard")
 source_options = ["Bot clicks (bypass.py)"]
 if GSC_AVAILABLE:
     source_options.append("Google Search Console (live)")
+if LLM_AVAILABLE:
+    source_options.append("LLM visibility (ChatGPT / Claude / Perplexity / Gemini)")
 
 with st.sidebar:
     st.header("Data source")
@@ -130,9 +190,203 @@ with st.sidebar:
     if not GSC_AVAILABLE:
         st.caption("GSC live source unavailable — `gsc_fetch.py` / its Google "
                    "libraries could not be imported.")
+    if not LLM_AVAILABLE:
+        st.caption("LLM visibility unavailable — `llm_visibility.py` / "
+                   "`llm_referrals.py` / `llm_crawlers.py` could not be imported.")
     st.divider()
 
 USE_GSC = source.startswith("Google Search Console")
+USE_LLM = source.startswith("LLM visibility")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# LLM VISIBILITY VIEW  (citations · referrals · crawlers)
+# ══════════════════════════════════════════════════════════════════════════
+if USE_LLM:
+    st.caption("How ChatGPT, Claude, Perplexity & Gemini see imperiumai.ai")
+    tab_cite, tab_ref, tab_crawl = st.tabs(
+        ["🔎 Citations (live)", "↩️ Referral traffic", "🤖 AI crawlers"]
+    )
+
+    # ---------------------------------------------------------------- Citations
+    with tab_cite:
+        avail = llmv.available_providers()
+        prov_labels = {"openai": "OpenAI (ChatGPT)", "anthropic": "Anthropic (Claude)",
+                       "perplexity": "Perplexity", "gemini": "Google (Gemini)"}
+        ready = [p for p, ok in avail.items() if ok]
+
+        with st.sidebar:
+            st.header("Citation options")
+            st.caption("Provider keys detected in secrets:")
+            for p, ok in avail.items():
+                st.write(f"{'✅' if ok else '⬜'} {prov_labels[p]}")
+            picked = st.multiselect(
+                "Query which providers?",
+                options=list(prov_labels),
+                default=ready or list(prov_labels),
+                format_func=lambda p: prov_labels[p],
+            )
+            run_live = st.button("▶️ Run live citation check",
+                                 disabled=not ready,
+                                 help=None if ready else "Add at least one provider key to secrets")
+            st.button("🔄 Clear cache", on_click=run_llm_citations.clear)
+
+        st.markdown(
+            "**Citation tracking** asks each model your tracked keywords as "
+            "questions and checks whether **imperiumai.ai** shows up in the "
+            "answer text (mentioned) or the model's cited sources (cited)."
+        )
+
+        cdf = pd.DataFrame()
+        if run_live and picked:
+            cdf = run_llm_citations(tuple(picked))
+            if cdf.empty and cdf.attrs.get("error"):
+                st.error(cdf.attrs["error"])
+        else:
+            cdf = load_llm_citations(LLM_VIS_GLOB)
+            if cdf.empty:
+                st.info("No saved citation runs yet. Add provider keys to "
+                        "secrets and click **Run live citation check**, or run "
+                        "`python llm_visibility.py` to generate a report CSV.")
+
+        if not cdf.empty:
+            # latest date only for the headline KPIs
+            latest = cdf[cdf["date"] == cdf["date"].max()]
+            n_probes = len(latest)
+            mention_rate = 100 * latest["mentioned"].mean() if n_probes else 0
+            cite_rate = 100 * latest["cited"].mean() if n_probes else 0
+            cited_ranks = latest.loc[latest["rank"] > 0, "rank"]
+            avg_rank = cited_ranks.mean() if len(cited_ranks) else 0
+
+            st.caption(f"Latest run: {cdf['date'].max().date()} · {n_probes} probes")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Probes", f"{n_probes}")
+            c2.metric("Mention rate", f"{mention_rate:.0f}%")
+            c3.metric("Citation rate", f"{cite_rate:.0f}%")
+            c4.metric("Avg cite rank", f"{avg_rank:.1f}" if avg_rank else "—")
+            st.divider()
+
+            left, right = st.columns(2)
+            # Citation rate by provider
+            by_prov = latest.groupby("provider", as_index=False).agg(
+                mention_rate=("mentioned", "mean"), cite_rate=("cited", "mean"))
+            by_prov[["mention_rate", "cite_rate"]] *= 100
+            fig_p = px.bar(
+                by_prov.melt(id_vars="provider", value_vars=["mention_rate", "cite_rate"],
+                             var_name="metric", value_name="pct"),
+                x="provider", y="pct", color="metric", barmode="group",
+                title="Mention & Citation Rate by LLM (%)",
+            )
+            left.plotly_chart(fig_p, use_container_width=True)
+
+            # Citation rate by page
+            by_pg = latest.groupby("page", as_index=False)["cited"].mean()
+            by_pg["cited"] *= 100
+            fig_pg = px.bar(by_pg, x="page", y="cited", color="page",
+                            text="cited", title="Citation Rate by Page (%)")
+            fig_pg.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
+            fig_pg.update_layout(showlegend=False)
+            right.plotly_chart(fig_pg, use_container_width=True)
+
+            # provider × page heatmap of citation rate
+            pivot = (latest.pivot_table(index="provider", columns="page",
+                                        values="cited", aggfunc="mean") * 100).round(0)
+            if not pivot.empty:
+                fig_hm = px.imshow(pivot, text_auto=True, aspect="auto",
+                                   color_continuous_scale="Blues",
+                                   title="Citation Rate — Provider × Page (%)")
+                st.plotly_chart(fig_hm, use_container_width=True)
+
+            # trend over time if multiple dates
+            if cdf["date"].nunique() > 1:
+                trend = cdf.groupby(["date", "provider"], as_index=False)["cited"].mean()
+                trend["cited"] *= 100
+                fig_t = px.line(trend, x="date", y="cited", color="provider",
+                                markers=True, title="Citation Rate Over Time (%)")
+                st.plotly_chart(fig_t, use_container_width=True)
+
+            with st.expander("View raw citation data"):
+                show = latest.copy()
+                show["date"] = show["date"].dt.date
+                keep = [c for c in ["date", "page", "keyword", "provider", "model",
+                                    "mentioned", "cited", "rank", "n_citations", "answer"]
+                        if c in show.columns]
+                st.dataframe(show[keep], use_container_width=True, hide_index=True)
+
+    # ---------------------------------------------------------------- Referrals
+    with tab_ref:
+        with st.sidebar:
+            st.header("Log source")
+            log_path = st.text_input("Access-log file or folder", value=DEFAULT_LOG_DIR,
+                                     key="llm_log_path")
+            st.button("🔄 Re-parse logs",
+                      on_click=lambda: (load_referrals.clear(), load_crawlers.clear()))
+
+        st.markdown("**Referral traffic** = real visits whose HTTP referrer is an "
+                    "LLM product (chatgpt.com, perplexity.ai, claude.ai, gemini…).")
+        rdf = load_referrals(log_path)
+        if rdf.empty:
+            st.info(rdf.attrs.get("error", "No referral data."))
+        else:
+            total = int(rdf["visits"].sum())
+            top_src = rdf.groupby("source")["visits"].sum().idxmax()
+            k1, k2, k3 = st.columns(3)
+            k1.metric("LLM referral visits", f"{total:,}")
+            k2.metric("Top LLM source", top_src)
+            k3.metric("Sources seen", f"{rdf['source'].nunique()}")
+            st.divider()
+
+            l, r = st.columns(2)
+            by_src = rdf.groupby("source", as_index=False)["visits"].sum()
+            l.plotly_chart(px.bar(by_src, x="source", y="visits", color="source",
+                                  title="Visits by LLM Source").update_layout(showlegend=False),
+                           use_container_width=True)
+            by_pg = rdf.groupby("page", as_index=False)["visits"].sum()
+            r.plotly_chart(px.pie(by_pg, names="page", values="visits", hole=0.45,
+                                  title="Referral Visits by Page"),
+                           use_container_width=True)
+            over = rdf.groupby(["date", "source"], as_index=False)["visits"].sum()
+            st.plotly_chart(px.line(over, x="date", y="visits", color="source",
+                                    markers=True, title="LLM Referral Visits Over Time"),
+                            use_container_width=True)
+            with st.expander("View raw referral data"):
+                st.dataframe(rdf, use_container_width=True, hide_index=True)
+
+    # ----------------------------------------------------------------- Crawlers
+    with tab_crawl:
+        log_path = st.session_state.get("llm_log_path", DEFAULT_LOG_DIR)
+        st.markdown("**AI crawlers** = hits from bot user-agents like GPTBot, "
+                    "OAI-SearchBot, ClaudeBot, PerplexityBot, Google-Extended. "
+                    "Shows whether the models are indexing you at all.")
+        wdf = load_crawlers(log_path)
+        if wdf.empty:
+            st.info(wdf.attrs.get("error", "No crawler data."))
+        else:
+            total = int(wdf["hits"].sum())
+            top_bot = wdf.groupby("bot")["hits"].sum().idxmax()
+            k1, k2, k3 = st.columns(3)
+            k1.metric("AI-crawler hits", f"{total:,}")
+            k2.metric("Most active bot", top_bot)
+            k3.metric("Bots seen", f"{wdf['bot'].nunique()}")
+            st.divider()
+
+            l, r = st.columns(2)
+            by_bot = wdf.groupby(["bot", "vendor"], as_index=False)["hits"].sum()
+            l.plotly_chart(px.bar(by_bot, x="bot", y="hits", color="vendor",
+                                  title="Crawler Hits by Bot"),
+                           use_container_width=True)
+            by_vendor = wdf.groupby("vendor", as_index=False)["hits"].sum()
+            r.plotly_chart(px.pie(by_vendor, names="vendor", values="hits", hole=0.45,
+                                  title="Crawl Share by Vendor"),
+                           use_container_width=True)
+            over = wdf.groupby(["date", "vendor"], as_index=False)["hits"].sum()
+            st.plotly_chart(px.line(over, x="date", y="hits", color="vendor",
+                                    markers=True, title="AI-Crawler Hits Over Time"),
+                            use_container_width=True)
+            with st.expander("View raw crawler data"):
+                st.dataframe(wdf, use_container_width=True, hide_index=True)
+
+    st.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════
