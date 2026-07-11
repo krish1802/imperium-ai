@@ -48,7 +48,7 @@ except Exception:
 REPORT_DIR = os.path.join("seo_reports", "imperiumai_ai")  # matches Site.slug
 CSV_GLOB = os.path.join(REPORT_DIR, "traffic_generated_*.csv")
 LLM_VIS_GLOB = os.path.join(REPORT_DIR, "llm_visibility_*.csv")
-DEFAULT_LOG_DIR = "logs"  # where access logs live (for referrals + crawlers)
+DEFAULT_LOG_DIR = "imperiumai.ai-ssl_log"  # where access logs live (for referrals + crawlers)
 
 st.set_page_config(page_title="imperiumai.ai · SEO Traffic", layout="wide")
 
