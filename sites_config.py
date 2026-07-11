@@ -1,123 +1,144 @@
 """
-Minimal site registry + auto-fetcher for a single (non-WordPress) website.
+Central registry for all sites managed by the SEO toolkit.
 
-You only specify the website name — everything else (URL, profile page,
-view-post page, filesystem-safe slug, output dir) is derived automatically.
+Single source of truth. Every other script imports SITES from here.
 
-No WordPress. No credentials. No GA4. Just the site name and a fetcher.
-
-Usage:
-    python imperiumai_site.py                       # fetch all default pages
-    python imperiumai_site.py imperiumai.ai         # fetch a given site's pages
-    python imperiumai_site.py imperiumai.ai /about  # fetch a single custom path
+Secrets handling:
+  - WP application passwords and the GA4 service-account JSON are sensitive.
+  - In production, prefer environment variables (WP_APP_PASS_<DOMAIN_KEY>) or
+    Streamlit secrets (st.secrets["sites"][domain]["wp_app_pass"]).
 """
 
 from __future__ import annotations
 
 import os
 import re
-import sys
 from dataclasses import dataclass, field, asdict
-from urllib.parse import urljoin
-
-try:
-    import requests
-except ImportError:  # graceful fallback if requests isn't installed
-    requests = None
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# The ONLY thing you need to set: the website name + pages to auto-search.
-# ──────────────────────────────────────────────────────────────────────────
+# Per-site "pages". Each page has:
+#   path     -> URL path prefix used to identify clicks for that page
+#   keywords -> the search terms to run for THAT page (plain search, no site:)
+# The bot searches each page's own keywords, then clicks only result links
+# whose URL falls under that page's path prefix.
+# Sites not listed here fall back to DEFAULT_PAGES (the whole site, using the
+# site-level tracked_keywords).
+DEFAULT_PAGES: dict[str, dict] = {"site": {"path": "/", "keywords": []}}
 
-WEBSITE = "imperiumai.ai"
-
-# Pages used for "automatic searching" — label -> path prefix.
-# Trailing slash marks these as PREFIXES: everything under the path is matched
-# (i.e. /view-post/* and /my-profile/*), not just the exact page.
-PAGES: dict[str, str] = {
-    "profile": "/my-profile/",
-    "view_post": "/view-post/",
+SITE_PAGES: dict[str, dict[str, dict]] = {
+    "imperiumai.ai": {
+        "my_profile": {
+            "path": "/my-profile/",
+            "keywords": [
+                "Imperium AI profile",
+                "imperiumai user profile",
+                "Imperium AI my profile",
+                "imperiumai.ai account",
+            ],
+        },
+        "view_post": {
+            "path": "/view-post/",
+            "keywords": [
+                "Imperium AI post",
+                "imperiumai article",
+                "Imperium AI blog post",
+                "imperiumai.ai view post",
+            ],
+        },
+    },
 }
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Site model (credential-free)
+# Site model
 # ──────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Site:
-    """One website — defined purely by its name."""
-    domain: str                                    # e.g. "imperiumai.ai"
-    pages: dict[str, str] = field(default_factory=lambda: dict(PAGES))
+    """One managed site (WordPress or plain)."""
+    domain: str                           # e.g. "sanfranciscobriefing.com"
+    site_url: str                         # e.g. "https://sanfranciscobriefing.com"
+    brand_name: str                       # human-readable name shown in UI
+    wp_user: str = ""                     # WordPress username (or email) — optional
+    wp_app_pass: str = ""                 # WP application password — optional
+    ga4_property_id: str = ""             # GA4 property ID (string)
+    site_description: str = ""            # short description
+    brand_logo_url: str = ""              # absolute URL to logo image
     tracked_keywords: list[str] = field(default_factory=list)
+    competitors: list[str] = field(default_factory=list)
+    # pages: label -> {"path": str, "keywords": list[str]}
+    pages: dict[str, dict] = field(default_factory=lambda: dict(DEFAULT_PAGES))
 
-    @property
-    def site_url(self) -> str:
-        return f"https://{self.domain.rstrip('/')}"
-
-    def page_url(self, label: str) -> str:
-        """Full URL for a named page, e.g. page_url('view_post')."""
-        path = self.pages[label]
-        return urljoin(self.site_url + "/", path.lstrip("/"))
-
-    @property
-    def page_urls(self) -> dict[str, str]:
-        """All page labels mapped to their absolute URLs."""
-        return {label: self.page_url(label) for label in self.pages}
-
-    # Backwards-compatible convenience accessors
-    @property
-    def profile_url(self) -> str:
-        return self.page_url("profile")
-
-    @property
-    def view_post_url(self) -> str:
-        return self.page_url("view_post")
-
-    @property
-    def brand_name(self) -> str:
-        """imperiumai.ai -> 'Imperiumai' (best-effort display name)."""
-        root = self.domain.split(".")[0]
-        return root.replace("-", " ").replace("_", " ").title()
+    # ── Page helpers (used by bypass.py keyword searches) ──────────────
 
     def page_path(self, label: str) -> str:
-        """The normalized path prefix for a page, e.g. '/view-post/'."""
-        path = self.pages[label]
-        if not path.startswith("/"):
-            path = "/" + path
-        return path
+        """Return the path prefix for a page label, e.g. '/view-post/'."""
+        return self.pages.get(label, {}).get("path", "/")
 
-    def match_page(self, url_or_path: str) -> str | None:
-        """Return the page label whose path-prefix matches this URL, else None.
+    def keywords_for(self, label: str) -> list[str]:
+        """Return the search keywords for a page label.
 
-        Matches /view-post/* and /my-profile/* (any sub-page under the prefix).
-        Longest prefix wins so overlapping paths resolve deterministically.
+        Falls back to the site-level tracked_keywords (then brand/domain) if
+        the page defines none.
         """
-        # Reduce a full URL down to just its path for comparison.
-        m = re.search(r"https?://[^/]+(/[^?#]*)", url_or_path)
-        path = m.group(1) if m else url_or_path
-        path = path.split("?", 1)[0].split("#", 1)[0]
-        if not path.startswith("/"):
-            path = "/" + path
+        kws = self.pages.get(label, {}).get("keywords") or []
+        if kws:
+            return list(kws)
+        return list(self.tracked_keywords) or [self.brand_name or self.domain]
 
-        best_label: str | None = None
+    def page_url(self, label: str) -> str:
+        """Full URL for a page label, e.g. https://imperiumai.ai/view-post/."""
+        return f"{self.site_url.rstrip('/')}/{self.page_path(label).lstrip('/')}"
+
+    def match_page(self, href: str) -> Optional[str]:
+        """Return the page label a URL belongs to, or None.
+
+        Matches by longest path prefix so nested pages resolve correctly.
+        Only URLs on this site's domain can match.
+        """
+        try:
+            parsed = urlparse(href)
+        except Exception:
+            return None
+        host = (parsed.netloc or "").lower().lstrip("www.")
+        if host and host != self.domain.lower():
+            return None
+        path = parsed.path or "/"
+        best_label: Optional[str] = None
         best_len = -1
-        for label in self.pages:
-            prefix = self.page_path(label).rstrip("/")
-            # Match the page itself (/view-post) or anything under it (/view-post/...).
-            if path == prefix or path.startswith(prefix + "/"):
-                if len(prefix) > best_len:
-                    best_label, best_len = label, len(prefix)
+        for label, cfg in self.pages.items():
+            pfx = (cfg.get("path", "/") or "/").rstrip("/") or "/"
+            if pfx == "/":
+                candidate_match = True
+            else:
+                candidate_match = path == pfx or path.startswith(pfx + "/") or path.startswith(pfx)
+            if candidate_match and len(pfx) > best_len:
+                best_label, best_len = label, len(pfx)
         return best_label
+
+    @property
+    def api_base(self) -> str:
+        return f"{self.site_url.rstrip('/')}/wp-json/wp/v2"
+
+    @property
+    def wp_url(self) -> str:
+        return self.site_url.rstrip("/")
 
     @property
     def slug(self) -> str:
         """Filesystem-safe key derived from domain — used for output dirs."""
         return re.sub(r"[^a-z0-9]+", "_", self.domain.lower()).strip("_")
 
-    def output_dir(self, base: str = "reports") -> str:
-        """Per-site output directory: reports/<slug>/"""
+    @property
+    def env_key(self) -> str:
+        """Env-var suffix, e.g. SANFRANCISCOBRIEFING_COM."""
+        return re.sub(r"[^A-Z0-9]+", "_", self.domain.upper()).strip("_")
+
+    def output_dir(self, base: str = "seo_reports") -> str:
+        """Per-site report directory: seo_reports/<slug>/"""
         path = os.path.join(base, self.slug)
         os.makedirs(path, exist_ok=True)
         return path
@@ -127,109 +148,182 @@ class Site:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Registry — built from just the website name(s)
+# Registry
 # ──────────────────────────────────────────────────────────────────────────
 
-def _clean_domain(domain: str) -> str:
-    domain = re.sub(r"^https?://", "", domain.strip().lower()).rstrip("/")
-    if domain.startswith("www."):
-        domain = domain[4:]
-    return domain.split("/", 1)[0]
+_DEFAULT_KEYWORDS = {
+    "sanfranciscobriefing.com": [
+        "San Francisco news", "SF local news", "Bay Area news",
+        "San Francisco politics", "San Francisco business news",
+        "San Francisco events", "San Francisco neighborhood news",
+    ],
+    "irvineweeklydigest.com": [
+        "Irvine news", "Irvine local news", "Orange County news",
+        "Irvine business", "Irvine events", "Irvine real estate",
+    ],
+    "b2bmoversdaily.com": [
+        "B2B moving industry", "commercial moving news", "logistics news",
+        "moving company industry", "B2B logistics",
+    ],
+    "themiamientrepreneur.com": [
+        "Miami entrepreneurs", "Miami startups", "Miami business news",
+        "South Florida startups", "Miami tech",
+    ],
+    "losangelesinfluence.com": [
+        "Los Angeles influencers", "LA culture", "LA lifestyle",
+        "Los Angeles entertainment", "LA business",
+    ],
+    "nyartisinal.com": [
+        "NY artisans", "New York craft", "artisanal New York",
+        "NYC makers", "small batch New York",
+    ],
+    "lasvegasmonthlyreview.com": [
+        "Las Vegas news", "Vegas business", "Las Vegas events",
+        "Vegas entertainment", "Nevada news",
+    ],
+    "newyorkdailydigest.com": [
+        "New York news", "NYC news", "New York City news",
+        "Manhattan news", "NYC business",
+    ],
+    "newyorkluxurymag.com": [
+        "New York luxury", "NYC luxury lifestyle", "NY high end",
+        "Manhattan luxury", "luxury New York real estate",
+    ],
+    "culturdceo.com": [
+        "CEO culture", "leadership news", "executive insights",
+        "corporate culture", "C-suite news",
+    ],
+    "thenewyorkentrepreneur.com": [
+        "New York entrepreneurs", "NYC startups", "NY business news",
+        "Manhattan startups", "NY founders",
+    ],
+    "thelosangelesentrepreneur.com": [
+        "Los Angeles entrepreneurs", "LA startups", "LA business news",
+        "Southern California startups", "LA founders",
+    ],
+    "imperiumai.ai": [
+        "Imperium AI", "imperiumai", "AI platform",
+        "artificial intelligence tools", "AI SaaS",
+    ],
+}
 
 
-def make_site(domain: str, pages: dict[str, str] | None = None) -> Site:
-    """Build a Site from only its name (URLs/slug are derived)."""
-    return Site(domain=_clean_domain(domain), pages=dict(pages or PAGES))
+def _brand_from_domain(domain: str) -> str:
+    """sanfranciscobriefing.com -> 'San Francisco Briefing' (best-effort)."""
+    name = domain.split(".")[0]
+    overrides = {
+        "sanfranciscobriefing": "San Francisco Briefing",
+        "irvineweeklydigest": "Irvine Weekly Digest",
+        "b2bmoversdaily": "B2B Movers Daily",
+        "themiamientrepreneur": "The Miami Entrepreneur",
+        "losangelesinfluence": "Los Angeles Influence",
+        "nyartisinal": "NY Artisanal",
+        "lasvegasmonthlyreview": "Las Vegas Monthly Review",
+        "newyorkdailydigest": "New York Daily Digest",
+        "newyorkluxurymag": "New York Luxury Mag",
+        "culturdceo": "Cultured CEO",
+        "thenewyorkentrepreneur": "The New York Entrepreneur",
+        "thelosangelesentrepreneur": "The Los Angeles Entrepreneur",
+        "imperiumai": "Imperium AI",
+    }
+    if name in overrides:
+        return overrides[name]
+    return name.replace("-", " ").title()
 
 
-SITES: list[Site] = [make_site(WEBSITE)]
+def _env_or(default: str, env_key: str) -> str:
+    """Prefer env var if present and non-empty, else default."""
+    val = os.getenv(env_key, "").strip()
+    return val or default
+
+
+# Raw cred rows — domain, user, app-pass, GA4 property
+# imperiumai.ai is credential-free (not a WordPress site): blank user/pass/GA4.
+_RAW_SITES: list[tuple[str, str, str, str]] = [
+    ("sanfranciscobriefing.com",     "testing",                  "sTz9 HbAF ROBO prvo SrI2 gJb7", "534913592"),
+    ("irvineweeklydigest.com",       "pangeaiimp@gmail.com",     "Jv8Y PPHa H4Lo 8ulW CbEC 43wb", "535749103"),
+    ("b2bmoversdaily.com",           "editorialstaff",           "qqN3 3iDt qGBT ZyG2 k2Fl jjbo", "535799209"),
+    ("themiamientrepreneur.com",     "texasfashioninsider",      "thoE HfBm yc0X PssD qLmF xhkP", "535799207"),
+    ("losangelesinfluence.com",      "losangelesinfluence",      "lu8C nbFh rIXi B85M zxdp MSgB", "535799884"),
+    ("nyartisinal.com",              "texasfashioninsider",      "316l SeLI M4Nf cKte Xrdh h9PS", "535796573"),
+    ("lasvegasmonthlyreview.com",    "texasfashioninsider",      "JvhM jN72 Nhv6 uGHu Gr1k Ik2v", "535810926"),
+    ("newyorkdailydigest.com",       "editorialstaff",           "m53D iAUl wkXA QlsN KEOt jtRA", "535730287"),
+    ("newyorkluxurymag.com",         "pangeaiimp@gmail.com",     "Om18 yi1k KDfd pBxp lpJU onJA", "535729084"),
+    ("culturdceo.com",               "autofuturesweekly",        "C248 yEXG 4D2L DxQ4 kAeI xVA2", "535730288"),
+    ("thenewyorkentrepreneur.com",   "pangeaiimp@gmail.com",     "LIJZ xVLM Eo3Q KIXK swCF ZsFf", "535730849"),
+    ("thelosangelesentrepreneur.com","texasfashioninsider",      "dunn KBPl 48AU FtEJ vxqC auuy", "535745293"),
+    ("imperiumai.ai",                "",                         "",                              ""),
+]
+
+
+def _build_default_sites() -> list[Site]:
+    sites: list[Site] = []
+    for domain, user, app_pass, ga4_id in _RAW_SITES:
+        site_url = f"https://{domain}"
+        env_key = re.sub(r"[^A-Z0-9]+", "_", domain.upper()).strip("_")
+        sites.append(Site(
+            domain=domain,
+            site_url=site_url,
+            brand_name=_brand_from_domain(domain),
+            wp_user=_env_or(user, f"WP_USER_{env_key}"),
+            wp_app_pass=_env_or(app_pass, f"WP_APP_PASS_{env_key}"),
+            ga4_property_id=_env_or(ga4_id, f"GA4_PROPERTY_ID_{env_key}"),
+            brand_logo_url=os.getenv(f"BRAND_LOGO_URL_{env_key}", f"{site_url}/wp-content/uploads/logo.png"),
+            site_description=f"News, business and culture coverage from {_brand_from_domain(domain)}.",
+            tracked_keywords=_DEFAULT_KEYWORDS.get(domain, []),
+            competitors=[],
+            pages={k: dict(v) for k, v in SITE_PAGES.get(domain, DEFAULT_PAGES).items()},
+        ))
+    return sites
+
+
+SITES: list[Site] = _build_default_sites()
 SITES_BY_DOMAIN: dict[str, Site] = {s.domain: s for s in SITES}
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Lookup helpers
+# ──────────────────────────────────────────────────────────────────────────
+
 def get_site(domain_or_url: str) -> Site:
-    """Look up a registered site, or build one on the fly from its name."""
-    key = _clean_domain(domain_or_url)
-    return SITES_BY_DOMAIN.get(key, make_site(key))
+    """Look up a site by domain (or full URL). Raises KeyError if unknown."""
+    key = domain_or_url.strip().lower()
+    key = re.sub(r"^https?://", "", key).rstrip("/")
+    if key.startswith("www."):
+        key = key[4:]
+    key = key.split("/", 1)[0]
+    if key not in SITES_BY_DOMAIN:
+        raise KeyError(f"Unknown site: {domain_or_url!r}. Known: {list(SITES_BY_DOMAIN)}")
+    return SITES_BY_DOMAIN[key]
+
+
+def list_domains() -> list[str]:
+    return [s.domain for s in SITES]
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Automatic searching / fetching
+# Active site (used by Streamlit dashboard for module-level mutation)
 # ──────────────────────────────────────────────────────────────────────────
 
-def fetch_url(url: str, timeout: int = 20) -> dict:
-    """Fetch a single URL (public, no auth) and return status + text."""
-    if requests is None:
-        raise RuntimeError("The 'requests' package is required: pip install requests")
-
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SiteFetcher/1.0)"}
-    resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-
-    return {
-        "requested_url": url,
-        "final_url": resp.url,
-        "status_code": resp.status_code,
-        "ok": resp.ok,
-        "content_type": resp.headers.get("Content-Type", ""),
-        "length": len(resp.text),
-        "text": resp.text,
-    }
+_ACTIVE_DOMAIN: Optional[str] = None
 
 
-def fetch_page(site: Site, label: str, timeout: int = 20) -> dict:
-    """Fetch one named page for a site (e.g. 'profile' or 'view_post')."""
-    result = fetch_url(site.page_url(label), timeout=timeout)
-    result["domain"] = site.domain
-    result["page"] = label
-    return result
+def set_active(domain: str) -> Site:
+    """Mark a site as active in the process. Returns the resolved Site."""
+    global _ACTIVE_DOMAIN
+    site = get_site(domain)
+    _ACTIVE_DOMAIN = site.domain
+    return site
 
 
-def fetch_all(site: Site, timeout: int = 20) -> dict[str, dict]:
-    """Fetch every configured page for the site. Returns {label: result}."""
-    results: dict[str, dict] = {}
-    for label in site.pages:
-        try:
-            results[label] = fetch_page(site, label, timeout=timeout)
-        except Exception as exc:  # keep going even if one page fails
-            results[label] = {"page": label, "error": str(exc)}
-    return results
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────
-
-def _main(argv: list[str]) -> None:
-    domain = argv[1] if len(argv) > 1 else WEBSITE
-
-    # If a custom path is passed, fetch just that one page.
-    if len(argv) > 2:
-        custom_path = argv[2]
-        site = make_site(domain, pages={"custom": custom_path})
-        labels = ["custom"]
-    else:
-        site = make_site(domain)
-        labels = list(site.pages)
-
-    print(f"Site:       {site.brand_name}")
-    print(f"Domain:     {site.domain}")
-    print(f"Output dir: {site.output_dir()}")
-    for label in labels:
-        print(f"  {label:10s} -> {site.page_url(label)}")
-    print("-" * 60)
-
-    for label in labels:
-        try:
-            result = fetch_page(site, label)
-            print(f"[{label}] HTTP {result['status_code']}  ->  {result['final_url']}")
-            print(f"        Content-Type: {result['content_type']}  Bytes: {result['length']}")
-
-            out_file = os.path.join(site.output_dir(), f"{label}.html")
-            with open(out_file, "w", encoding="utf-8") as fh:
-                fh.write(result["text"])
-            print(f"        Saved: {out_file}")
-        except Exception as exc:  # keep CLI resilient
-            print(f"[{label}] Fetch failed: {exc}")
+def get_active() -> Site:
+    """Return active site, defaulting to the first registered site."""
+    if _ACTIVE_DOMAIN and _ACTIVE_DOMAIN in SITES_BY_DOMAIN:
+        return SITES_BY_DOMAIN[_ACTIVE_DOMAIN]
+    return SITES[0]
 
 
 if __name__ == "__main__":
-    _main(sys.argv)
+    print(f"Loaded {len(SITES)} sites:")
+    for s in SITES:
+        print(f"  {s.domain:35s}  slug={s.slug:25s}  ga4={s.ga4_property_id}")

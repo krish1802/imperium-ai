@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-Click-farm / search-bot tester — multi-site.
+Click-farm / search-bot tester — multi-site (keyword-driven).
 
-For every registered site, runs site:<domain> queries on Google / Yahoo / Bing
-and counts how many result links it can open. Saves per-site daily totals to:
+For every registered site, each PAGE has its own keyword list. The bot runs
+each page's keywords as a plain search on Google / Yahoo / Bing (NO site:
+operator), then clicks only the result links whose URL belongs to that page
+(e.g. /my-profile/* for the my_profile keywords, /view-post/* for view_post).
+Matching is enforced via Site.match_page().
+
+Saves per-site daily totals to:
     seo_reports/<slug>/traffic_generated_YYYY-MM-DD.csv
+CSV schema: date, site, page, engine, clicks
 
 CLI:
     python bypass.py                     # all sites, all engines
-    python bypass.py --site sanfranciscobriefing.com
+    python bypass.py --site imperiumai.ai
     python bypass.py --engines google.com,bing.com
 """
 
@@ -69,27 +75,21 @@ def _run_query(page, engine: str, query: str):
     return None
 
 
-def run_for_engine_page(page, engine: str, site: Site, label: str) -> int:
-    """Search `site:<domain><path>` for ONE page prefix and click matching results.
+def click_matching_links(page, link_locator, site: Site, label: str) -> int:
+    """Scan result links; click only those belonging to page `label`.
 
-    Uses a path-scoped query (e.g. site:imperiumai.ai/view-post) so only
-    sub-pages under /view-post/* (or /my-profile/*) come back, and double-checks
-    each href with site.match_page() so a click is only counted for THIS page.
+    A link is clicked only if Site.match_page(href) == label (i.e. the URL is
+    on this domain AND under THIS page's path prefix). Returns the click count.
     """
-    prefix = site.page_path(label).rstrip("/")          # e.g. /view-post
-    query = f"site:{site.domain}{prefix}"                # site:imperiumai.ai/view-post
     clicks = 0
-
-    link_locator = _run_query(page, engine, query)
     if link_locator is None:
-        return 0
+        return clicks
 
     for i in range(link_locator.count()):
         href = link_locator.nth(i).get_attribute("href")
         if not href or site.domain not in href:
             continue
-        # Only count the click if the URL really belongs to this page prefix.
-        if site.match_page(href) != label:
+        if site.match_page(href) != label:      # must belong to THIS page
             continue
         clicks += 1
         new_page = page.context.new_page()
@@ -101,6 +101,26 @@ def run_for_engine_page(page, engine: str, site: Site, label: str) -> int:
         finally:
             new_page.close()
     return clicks
+
+
+def run_for_engine(page, engine: str, site: Site) -> dict[str, int]:
+    """For each page, search ITS OWN keywords on `engine` and count page clicks.
+
+    Returns {page_label: clicks}.
+    """
+    totals: dict[str, int] = {label: 0 for label in site.pages}
+
+    for label in site.pages:
+        keywords = site.keywords_for(label)
+        for kw in keywords:
+            try:
+                link_locator = _run_query(page, engine, kw)
+                hits = click_matching_links(page, link_locator, site, label)
+                totals[label] += hits
+                print(f"      [{label}] kw '{kw}': {hits} click(s)")
+            except Exception as e:
+                print(f"      [{label}] kw '{kw}': error ({e}), skipped")
+    return totals
 
 
 # ── PERSISTENCE ─────────────────────────────────────────────────────────
@@ -128,18 +148,21 @@ def save_daily_clicks(site: Site, results: dict, base_output: str = "seo_reports
 # ── PER-SITE FLOW ───────────────────────────────────────────────────────
 
 def run_site(site: Site, page, engines: list[str]) -> dict:
-    """Run every configured PAGE across every engine. Returns {page: {engine: clicks}}."""
+    """Run all keywords across every engine. Returns {page: {engine: clicks}}."""
     daily: dict = {label: {e: 0 for e in engines} for label in site.pages}
-    for label in site.pages:
-        page_path = site.page_path(label)
-        for engine in engines:
-            try:
-                print(f"  ▶ [{site.domain}{page_path}*] running {engine} ...")
-                daily[label][engine] = run_for_engine_page(page, engine, site, label)
-                print(f"    {label} @ {engine}: {daily[label][engine]} clicks")
-            except Exception as e:
+    for engine in engines:
+        kw_total = sum(len(site.keywords_for(l)) for l in site.pages)
+        print(f"  ▶ [{site.domain}] running {engine} across {kw_total} page-keyword(s) ...")
+        try:
+            per_page = run_for_engine(page, engine, site)
+            for label, clicks in per_page.items():
+                daily[label][engine] = clicks
+            summary = ", ".join(f"{l}={c}" for l, c in per_page.items())
+            print(f"    {engine}: {summary}")
+        except Exception as e:
+            for label in site.pages:
                 daily[label][engine] = 0
-                print(f"    {label} @ {engine}: error ({e}), recorded 0")
+            print(f"    {engine}: error ({e}), recorded 0")
     out = save_daily_clicks(site, daily)
     print(f"  💾 [{site.domain}] saved → {out}")
     return daily
@@ -176,7 +199,7 @@ def run_all(engines: list[str] = DEFAULT_ENGINES, only_site: str | None = None) 
 
 
 def _main() -> None:
-    ap = argparse.ArgumentParser(description="Multi-site search-engine click farm")
+    ap = argparse.ArgumentParser(description="Multi-site keyword-driven click farm")
     ap.add_argument("--site", help="Run for one domain only")
     ap.add_argument("--engines", default=",".join(DEFAULT_ENGINES),
                     help="Comma-separated engines (default: google.com,yahoo.com,bing.com)")
