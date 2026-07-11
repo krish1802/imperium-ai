@@ -59,40 +59,56 @@ COLUMNS = ["date", "site", "page", "url", "query", "source",
 
 # ── Auth / service construction ─────────────────────────────────────────
 
-def _secrets_service_account() -> dict | None:
-    """Return a service-account dict from st.secrets, if present.
+def _service_account_info_from_secrets():
+    """Return a service-account info dict from Streamlit secrets, or None.
 
-    On Streamlit Community Cloud the JSON key is pasted into the app's
-    encrypted Secrets as a [gcp_service_account] table — never committed to
-    the repo. This reads it without requiring Streamlit at import time.
+    Supports either layout in .streamlit/secrets.toml:
+
+        # (a) a dedicated table
+        [gsc_service_account]
+        type = "service_account"
+        project_id = "..."
+        private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+        client_email = "...@....iam.gserviceaccount.com"
+        ...
+
+        # (b) same fields under [gcp_service_account] (Streamlit's common name)
     """
     try:
         import streamlit as st
     except Exception:
         return None
     try:
-        if "gcp_service_account" in st.secrets:
-            return dict(st.secrets["gcp_service_account"])
+        secrets = st.secrets
     except Exception:
-        pass
+        return None
+
+    for key in ("gsc_service_account", "gcp_service_account", "service_account"):
+        if key in secrets:
+            info = dict(secrets[key])
+            # TOML often escapes newlines in the private key; normalize them.
+            pk = info.get("private_key", "")
+            if "\\n" in pk and "\n" not in pk:
+                info["private_key"] = pk.replace("\\n", "\n")
+            return info
     return None
 
 
 def _build_service():
     """Build an authenticated Search Console API client.
 
-    Credential precedence:
-      1. st.secrets['gcp_service_account']   (Streamlit Cloud — recommended)
-      2. GSC_SERVICE_ACCOUNT_FILE            (local service-account JSON file)
-      3. GSC_OAUTH_CLIENT_FILE               (local interactive OAuth)
+    Auth precedence:
+      1. Streamlit secrets  (st.secrets['gsc_service_account'] / 'gcp_service_account')
+      2. Service-account key file (GSC_SERVICE_ACCOUNT_FILE)
+      3. OAuth client file (GSC_OAUTH_CLIENT_FILE)
     Raises a clear error if none is configured.
     """
     from googleapiclient.discovery import build
-    from google.oauth2 import service_account
 
-    # 1) Streamlit Cloud secrets (no file on disk).
-    sa_info = _secrets_service_account()
+    # 1) Streamlit secrets (inline service-account JSON) -----------------
+    sa_info = _service_account_info_from_secrets()
     if sa_info:
+        from google.oauth2 import service_account
         creds = service_account.Credentials.from_service_account_info(
             sa_info, scopes=SCOPES
         )
@@ -101,8 +117,8 @@ def _build_service():
     sa_file = os.environ.get("GSC_SERVICE_ACCOUNT_FILE")
     oauth_file = os.environ.get("GSC_OAUTH_CLIENT_FILE")
 
-    # 2) Local service-account file.
     if sa_file:
+        from google.oauth2 import service_account
         creds = service_account.Credentials.from_service_account_file(
             sa_file, scopes=SCOPES
         )
@@ -128,10 +144,9 @@ def _build_service():
         return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
     raise RuntimeError(
-        "No Google credentials configured. On Streamlit Cloud, add a "
-        "[gcp_service_account] table in the app's Secrets. Locally, set "
-        "GSC_SERVICE_ACCOUNT_FILE or GSC_OAUTH_CLIENT_FILE. See "
-        "DEPLOY_STREAMLIT.md / gsc_fetch.py for setup steps."
+        "No Google credentials configured. Add a [gsc_service_account] table to "
+        ".streamlit/secrets.toml, or set GSC_SERVICE_ACCOUNT_FILE / "
+        "GSC_OAUTH_CLIENT_FILE. See the docstring in gsc_fetch.py for setup steps."
     )
 
 

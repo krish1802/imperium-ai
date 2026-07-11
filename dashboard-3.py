@@ -1,10 +1,13 @@
 """
 SEO Traffic Dashboard for imperiumai.ai
 
-Reads the report CSVs that bypass.py writes into:
-    seo_reports/imperiumai_ai/traffic_generated_YYYY-MM-DD.csv
+Two data sources, switchable in the sidebar:
+  1. Bot clicks (bypass.py) — self-generated search-result clicks from
+     seo_reports/imperiumai_ai/traffic_generated_YYYY-MM-DD.csv
+  2. Google Search Console (live) — real clicks / impressions / CTR / position
+     pulled via gsc_fetch.py (auth from Streamlit secrets).
 
-Handles BOTH CSV schemas transparently:
+Bot CSVs handle BOTH schemas transparently:
     old:  date, site, engine, clicks
     new:  date, site, page, engine, clicks
 Files missing a `page` column are treated as page = "all".
@@ -22,6 +25,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+# Live Google Search Console fetcher (optional — degrades gracefully).
+try:
+    from gsc_fetch import fetch_gsc, default_range
+    GSC_AVAILABLE = True
+except Exception:
+    GSC_AVAILABLE = False
+
 # ──────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────
@@ -33,7 +43,17 @@ st.set_page_config(page_title="imperiumai.ai · SEO Traffic", layout="wide")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Data loading — schema-tolerant
+# GSC live loader
+# ──────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner="Fetching Google Search Console …")
+def load_gsc(start: str, end: str, by_query: bool) -> pd.DataFrame:
+    """Cached GSC fetch (tracked pages only)."""
+    return fetch_gsc(start=start, end=end, by_query=by_query, tracked_only=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Data loading — schema-tolerant (bot CSVs)
 # ──────────────────────────────────────────────────────────────────────────
 
 EXPECTED_COLS = ["date", "site", "page", "engine", "clicks"]
@@ -98,6 +118,141 @@ def load_data(pattern: str) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────
 
 st.title("imperiumai.ai — SEO Traffic Dashboard")
+
+# ---- Data source selector -------------------------------------------------
+source_options = ["Bot clicks (bypass.py)"]
+if GSC_AVAILABLE:
+    source_options.append("Google Search Console (live)")
+
+with st.sidebar:
+    st.header("Data source")
+    source = st.radio("Show data from", source_options, index=0)
+    if not GSC_AVAILABLE:
+        st.caption("GSC live source unavailable — `gsc_fetch.py` / its Google "
+                   "libraries could not be imported.")
+    st.divider()
+
+USE_GSC = source.startswith("Google Search Console")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# GOOGLE SEARCH CONSOLE VIEW (live)
+# ══════════════════════════════════════════════════════════════════════════
+if USE_GSC:
+    st.caption("Source: Google Search Console API · https://imperiumai.ai/")
+
+    with st.sidebar:
+        st.header("GSC options")
+        lookback = st.slider("Look-back window (days)", 7, 180, 30, step=1)
+        by_query = st.checkbox("Break down by search query", value=False)
+        st.button("🔄 Refresh GSC", on_click=load_gsc.clear)
+
+    g_start, g_end = default_range(lookback)
+    gsc = load_gsc(g_start, g_end, by_query)
+
+    if gsc.empty:
+        err = gsc.attrs.get("error")
+        if err:
+            st.error(
+                f"Could not fetch GSC data:\n\n**{err}**\n\n"
+                "Check that your service account is in Streamlit secrets under "
+                "`[gsc_service_account]` and has access to the property."
+            )
+        else:
+            st.info(f"No GSC data for {g_start} → {g_end} on the tracked pages.")
+        st.stop()
+
+    # -- Page filter
+    with st.sidebar:
+        g_pages = sorted(gsc["page"].unique())
+        g_picked = st.multiselect("Pages", g_pages, default=g_pages, key="gsc_pages")
+    gview = gsc[gsc["page"].isin(g_picked)]
+    if gview.empty:
+        st.warning("No GSC data matches the current filters.")
+        st.stop()
+
+    # -- KPI cards (weighted CTR/position, not naive means)
+    g_clicks = int(gview["clicks"].sum())
+    g_impr = int(gview["impressions"].sum())
+    g_ctr = (g_clicks / g_impr * 100) if g_impr else 0.0
+    # Impression-weighted average position
+    g_pos = (
+        (gview["position"] * gview["impressions"]).sum() / g_impr if g_impr else 0.0
+    )
+
+    st.caption(f"Window: {g_start} → {g_end} (GSC data lags ~2 days)")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Clicks", f"{g_clicks:,}")
+    k2.metric("Impressions", f"{g_impr:,}")
+    k3.metric("CTR", f"{g_ctr:.2f}%")
+    k4.metric("Avg position", f"{g_pos:.1f}")
+    st.divider()
+
+    # -- Charts
+    gl, gr = st.columns(2)
+
+    # Clicks & impressions by page
+    by_page = gview.groupby("page", as_index=False)[["clicks", "impressions"]].sum()
+    fig_gp = px.bar(
+        by_page.melt(id_vars="page", value_vars=["clicks", "impressions"],
+                     var_name="metric", value_name="value"),
+        x="page", y="value", color="metric", barmode="group",
+        title="Clicks & Impressions by Page",
+    )
+    gl.plotly_chart(fig_gp, use_container_width=True)
+
+    # CTR by page
+    ctr_page = by_page.assign(
+        ctr=lambda d: (d["clicks"] / d["impressions"].replace(0, pd.NA) * 100).fillna(0)
+    )
+    fig_ctr = px.bar(
+        ctr_page, x="page", y="ctr", color="page", text="ctr",
+        title="CTR by Page (%)",
+    )
+    fig_ctr.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
+    fig_ctr.update_layout(showlegend=False)
+    gr.plotly_chart(fig_ctr, use_container_width=True)
+
+    # Clicks & impressions over time
+    over_time = gview.groupby(["date", "page"], as_index=False)[["clicks", "impressions"]].sum()
+    fig_line = px.line(
+        over_time, x="date", y="clicks", color="page", markers=True,
+        title="Clicks Over Time (by page)",
+    )
+    st.plotly_chart(fig_line, use_container_width=True)
+
+    fig_impr = px.line(
+        over_time, x="date", y="impressions", color="page", markers=True,
+        title="Impressions Over Time (by page)",
+    )
+    st.plotly_chart(fig_impr, use_container_width=True)
+
+    # Top queries (only when broken down by query)
+    if by_query and "query" in gview.columns and gview["query"].astype(bool).any():
+        top_q = (
+            gview.groupby("query", as_index=False)[["clicks", "impressions"]].sum()
+            .sort_values("clicks", ascending=False).head(20)
+        )
+        st.subheader("Top queries")
+        fig_q = px.bar(top_q, x="clicks", y="query", orientation="h",
+                       title="Top 20 Queries by Clicks")
+        fig_q.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_q, use_container_width=True)
+
+    with st.expander("View raw GSC data"):
+        st.dataframe(
+            gview.assign(date=gview["date"].dt.date).sort_values(
+                ["date", "clicks"], ascending=[True, False]
+            ),
+            use_container_width=True, hide_index=True,
+        )
+
+    st.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# BOT CLICKS VIEW (bypass.py CSVs)
+# ══════════════════════════════════════════════════════════════════════════
 st.caption(f"Source: `{CSV_GLOB}`")
 
 data = load_data(CSV_GLOB)
